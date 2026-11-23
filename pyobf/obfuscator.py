@@ -1,4 +1,4 @@
-"""Orchestration for pyobf v0.1alpha: discover, two-pass rename, write."""
+"""Orchestration for pyobf v0.1alpha.2: discover, two-pass rename, write."""
 from __future__ import annotations
 
 import ast
@@ -6,12 +6,11 @@ import fnmatch
 import hashlib
 import json
 import random
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .naming import NameGenerator
-from .strings import HELPER_NAME, derive_key, helper_source
+from .strings import derive_master, helper_name_for, helper_source
 from .transform import Renamer
 
 
@@ -27,6 +26,7 @@ class FileResult:
     renamed_locals: int = 0
     renamed_top: int = 0
     strings_encrypted: int = 0
+    ints_obfuscated: int = 0
     bytes_in: int = 0
     bytes_out: int = 0
 
@@ -59,10 +59,27 @@ def _is_private_top(name: str) -> bool:
     return name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
 
 
+def _private_targets(target: ast.AST) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        out: list[str] = []
+        for elt in target.elts:
+            out.extend(_private_targets(elt))
+        return out
+    return []
+
+
 def collect_top_maps(
     sources: list[tuple[Path, Path, str]], name_gen: NameGenerator
 ) -> dict[str, dict[str, str]]:
-    """First pass: every private top-level def/class in the project."""
+    """First pass: every private top-level def/class/variable in the project.
+
+    Alpha.2 adds private module-level variables (``_SECRET = ...``) to the
+    map that alpha.1 only built for def/class names. Cross-file imports
+    and ``mod._SECRET`` attribute access are rewritten by the same
+    machinery as for private functions.
+    """
     maps: dict[str, dict[str, str]] = {}
     for _src, rel, text in sources:
         mod = module_name_for(rel)
@@ -71,21 +88,44 @@ def collect_top_maps(
         except SyntaxError as exc:
             raise ObfuscateError(f"{rel}: 语法错误 {exc.msg} (行 {exc.lineno})") from exc
         top: dict[str, str] = {}
+        scope = f"{mod}:<module>"
+
+        def _add(name: str) -> None:
+            if _is_private_top(name) and name not in top:
+                top[name] = name_gen.generate(name, scope)
+
         for stmt in tree.body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if _is_private_top(stmt.name):
-                    scope = f"{mod}:<module>"
-                    top[stmt.name] = name_gen.generate(stmt.name, scope)
+                _add(stmt.name)
+            elif isinstance(stmt, ast.Assign):
+                for tgt in stmt.targets:
+                    for name in _private_targets(tgt):
+                        _add(name)
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                _add(stmt.target.id)
         if top:
             maps[mod] = top
     return maps
 
 
-def _insert_helper(tree: ast.Module, helper_name: str, key: bytes) -> bool:
-    """Insert the string-decoder after any ``__future__`` imports."""
-    if helper_name in {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}:
-        return False
-    helper_tree = ast.parse(helper_source(helper_name, key))
+def _insert_helper(tree: ast.Module, helper_name: str, master: bytes, mapping_values: set[str]) -> str:
+    """Insert the string-decoder after any ``__future__`` imports.
+
+    Returns the helper name actually used. If the deterministic name
+    collides with a renamed identifier in this file (vanishingly rare,
+    but checked), the call sites are rewritten to a suffixed name.
+    """
+    actual = helper_name
+    suffix = 1
+    existing_defs = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    while actual in mapping_values or actual in existing_defs:
+        actual = f"{helper_name}_{suffix}"
+        suffix += 1
+    if actual != helper_name:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == helper_name:
+                node.id = actual
+    helper_tree = ast.parse(helper_source(actual, master))
     helper_def = helper_tree.body[0]
     idx = 0
     for i, stmt in enumerate(tree.body):
@@ -94,15 +134,34 @@ def _insert_helper(tree: ast.Module, helper_name: str, key: bytes) -> bool:
         else:
             break
     tree.body.insert(idx, helper_def)
-    return True
+    return actual
 
 
 def _junk_source(seed: str, module_name: str) -> str:
+    """Dead code for level 3: opaque predicate + an unused function.
+
+    Alpha.1 used a literal ``if False:``. Alpha.2 uses an opaque
+    predicate whose falsity requires computing ``(a * b) % 7`` (the
+    embedded target is chosen so the condition is False by construction)
+    and adds one never-called function with a realistic-looking body.
+    Neither ever executes.
+    """
     digest = hashlib.sha256(f"{seed}\x00{module_name}\x00junk".encode()).hexdigest()
     rng = random.Random(int(digest[:8], 16))
-    lines = ["if False:"]
+    a, b = rng.randint(10, 99), rng.randint(10, 99)
+    target = ((a * b) % 7 + 1) % 7  # condition below is False by construction
+    junk_fn = "_" + digest[12:22]
+    lines = [
+        f"def {junk_fn}(_a, _b):",
+        "    _t = 0",
+        "    for _i in range(_a):",
+        "        _t += _i * _b",
+        "    return _t",
+        "",
+        f"if {a} * {b} % 7 == {target}:",
+    ]
     for i in range(3):
-        name = f"_pyobf_junk_{digest[8 + i * 4:12 + i * 4]}"
+        name = f"_{digest[8 + i * 4:12 + i * 4]}"
         lines.append(f"    {name} = {rng.randint(1000, 999999)}")
     return "\n".join(lines) + "\n"
 
@@ -137,6 +196,7 @@ def obfuscate_project(
     keep_names: set[str] | None = None,
     exclude: list[str] | None = None,
     dry_run: bool = False,
+    obfuscate_ints: bool | None = None,
 ) -> RunResult:
     if level not in (1, 2, 3):
         raise ObfuscateError("level 只能是 1、2、3")
@@ -146,6 +206,8 @@ def obfuscate_project(
         encrypt_strings = level >= 2
     if add_junk is None:
         add_junk = level >= 3
+    if obfuscate_ints is None:
+        obfuscate_ints = level >= 2
 
     keep = set(keep_names or set())
     exclude = list(exclude or [])
@@ -154,7 +216,7 @@ def obfuscate_project(
         raise ObfuscateError(f"在 {input_path} 下没有找到 .py 文件")
 
     name_gen = NameGenerator(seed)
-    key = derive_key(seed)
+    master = derive_master(seed)
 
     # Read all sources first (fail fast on syntax errors / encoding).
     sources: list[tuple[Path, Path, str]] = []
@@ -183,6 +245,7 @@ def obfuscate_project(
         except SyntaxError as exc:
             raise ObfuscateError(f"{rel}: 语法错误 {exc.msg} (行 {exc.lineno})") from exc
 
+        helper_name = helper_name_for(str(seed), mod)
         renamer = Renamer(
             seed=str(seed),
             name_gen=name_gen,
@@ -194,16 +257,20 @@ def obfuscate_project(
             encrypt_strings=encrypt_strings,
             strip_docstrings=strip_docstrings,
             keep_names=keep,
-            key=key,
+            master=master,
+            helper_name=helper_name,
+            obfuscate_ints=obfuscate_ints,
         )
         new_tree = renamer.transform(tree)
 
         needs_helper = renamer.stats["strings_encrypted"] > 0
         if needs_helper:
-            _insert_helper(new_tree, HELPER_NAME, key)
+            _insert_helper(new_tree, helper_name, master, set(renamer.mapping.values()))
         if add_junk:
             junk_tree = ast.parse(_junk_source(str(seed), mod))
-            new_tree.body.append(junk_tree.body[0])
+            # junk source is now several statements (unused function +
+            # opaque dead branch); append all of them, not just [0]
+            new_tree.body.extend(junk_tree.body)
 
         ast.fix_missing_locations(new_tree)
         try:
@@ -226,6 +293,7 @@ def obfuscate_project(
             renamed_locals=renamer.stats["renamed_locals"],
             renamed_top=renamer.stats["renamed_top"],
             strings_encrypted=renamer.stats["strings_encrypted"],
+            ints_obfuscated=renamer.stats["ints_obfuscated"],
             bytes_in=len(text.encode("utf-8")),
             bytes_out=len(out_text.encode("utf-8")),
         )
@@ -241,7 +309,7 @@ def obfuscate_project(
 def mapping_payload(result: RunResult) -> dict:
     return {
         "tool": "pyobf",
-        "version": "0.1.0-alpha",
+        "version": "0.1.0-alpha.2",
         "seed": result.seed,
         "level": result.level,
         "warning": "此映射文件可用于调试还原，发布时不要随混淆产物一起分发。",

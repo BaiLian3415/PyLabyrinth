@@ -30,8 +30,18 @@ _RESERVED = set(keyword.kwlist) | {
 
 
 def _hash_name(seed: str, scope: str, original: str, length: int = 8) -> str:
+    """Deterministic, varied-length name.
+
+    Alpha.1 always emitted ``_o`` + 8 hex chars, a fixed pattern trivial
+    to spot (and to strip with one regex). Alpha.2 keeps the leading
+    underscore (so generated names cannot collide with ordinary user
+    identifiers) but varies the length between 6 and 12 hex chars,
+    chosen from the hash itself, so there is no single pattern.
+    """
     digest = hashlib.sha256(f"{seed}\x00{scope}\x00{original}".encode("utf-8")).hexdigest()
-    return "_o" + digest[:length]
+    # first hex digit picks a length in {6, 8, 10, 12}
+    length = 6 + (int(digest[0], 16) % 4) * 2
+    return "_" + digest[1:1 + length]
 
 
 class NameGenerator:

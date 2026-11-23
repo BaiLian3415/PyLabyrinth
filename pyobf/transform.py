@@ -1,6 +1,6 @@
-"""AST transformer for pyobf v0.1alpha.
+"""AST transformer for pyobf v0.1alpha.2.
 
-Safety-first rules (v0.1):
+Safety-first rules (v0.1, kept in alpha.2):
 - Never rename attributes (``obj.attr``), imports, builtins, dunders,
   decorators, or keyword-argument names of unknown callees.
 - Local variables / loop / with / except / comprehension variables are
@@ -20,10 +20,11 @@ Safety-first rules (v0.1):
 from __future__ import annotations
 
 import ast
+import hashlib
 import keyword
 
 from .naming import NameGenerator
-from .strings import HELPER_NAME, encrypt_str
+from .strings import HELPER_NAME, encrypt_str_indexed
 
 _DUNDER_OK = ("self", "cls")
 
@@ -53,8 +54,10 @@ class Renamer(ast.NodeTransformer):
         encrypt_strings: bool,
         strip_docstrings: bool,
         keep_names: set[str],
-        key: bytes,
+        key: bytes | None = None,
         helper_name: str = HELPER_NAME,
+        obfuscate_ints: bool = False,
+        master: bytes | None = None,
     ):
         super().__init__()
         self.seed = seed
@@ -67,16 +70,23 @@ class Renamer(ast.NodeTransformer):
         self.encrypt_strings = encrypt_strings
         self.strip_docstrings = strip_docstrings
         self.keep_names = set(keep_names)
-        self.key = key
+        # alpha.2: `master` is the per-string-salt master; `key` is kept
+        # as an alias for callers still passing the old name.
+        self.master = master if master is not None else key
+        self.key = self.master
         self.helper_name = helper_name
+        self.obfuscate_ints = obfuscate_ints
 
         self.scopes: list[_Scope] = []
         self._path: list[str] = []  # qualified function/class names
         self._in_annotation = 0
+        self._in_match = 0
         self._in_all = False
+        self._str_index = 0
+        self._int_index = 0
         self.imported_modules: dict[str, str] = {}  # alias -> module name
 
-        self.stats = {"renamed_locals": 0, "renamed_top": 0, "strings_encrypted": 0}
+        self.stats = {"renamed_locals": 0, "renamed_top": 0, "strings_encrypted": 0, "ints_obfuscated": 0}
         # original -> obfuscated, scope-qualified keys for the map file
         self.mapping: dict[str, str] = {}
         # simple function name -> {param original: param obfuscated}
@@ -549,10 +559,50 @@ class Renamer(ast.NodeTransformer):
         node.values = new_values  # type: ignore[assignment]
         return node
 
+    def visit_Match(self, node: ast.Match) -> ast.Match:
+        # Patterns must stay literal: `case 5:` / `case "x":` cannot be
+        # replaced by a call or an arithmetic expression.
+        node.subject = self.visit(node.subject)
+        for case in node.cases:
+            self._in_match += 1
+            case.pattern = self.visit(case.pattern)
+            self._in_match -= 1
+            if case.guard is not None:
+                case.guard = self.visit(case.guard)
+            case.body = [self.visit(s) for s in case.body]
+        return node
+
+    def _obfuscate_int(self, node: ast.Constant) -> ast.AST:
+        n = node.value
+        assert type(n) is int
+        digest = hashlib.sha256(
+            f"{self.seed}\x00{self.module_name}\x00int\x00{n}\x00{self._int_index}".encode("utf-8")
+        ).hexdigest()
+        self._int_index += 1
+        # deterministic split n = a + b, a in [-5000, 5000]
+        a = int(digest[:4], 16) % 10001 - 5000
+        b = n - a
+        self.stats["ints_obfuscated"] += 1
+        expr = ast.BinOp(
+            left=ast.Constant(value=a),
+            op=ast.Add(),
+            right=ast.Constant(value=b),
+        )
+        return ast.copy_location(expr, node)
+
     def visit_Constant(self, node: ast.Constant) -> ast.AST:
+        # ints first (bool is a subclass of int: check exact type)
+        if type(node.value) is int:
+            if not self.obfuscate_ints:
+                return node
+            if self._in_annotation > 0 or self._in_match > 0:
+                return node
+            if abs(node.value) < 10:
+                return node  # 0/1/2/-1 and small indices stay readable
+            return self._obfuscate_int(node)
         if not isinstance(node.value, str):
             return node
-        if self._in_annotation > 0:
+        if self._in_annotation > 0 or self._in_match > 0:
             return node
         if not self.encrypt_strings:
             return node
@@ -564,7 +614,9 @@ class Renamer(ast.NodeTransformer):
             if text != node.value:
                 return ast.Constant(value=text)
             return node
-        encoded = encrypt_str(text, self.key)
+        assert self.master is not None
+        encoded = encrypt_str_indexed(text, self.master, self.seed, self.module_name, self._str_index)
+        self._str_index += 1
         self.stats["strings_encrypted"] += 1
         call = ast.Call(
             func=ast.Name(id=self.helper_name, ctx=ast.Load()),

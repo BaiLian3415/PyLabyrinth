@@ -1,8 +1,16 @@
 # pyobf — 纯 CLI 的 Python 代码混淆器
 
-**版本：v0.1alpha · 纯标准库，零第三方依赖 · Python 3.9+**
+**版本：v0.1alpha.2 · 纯标准库，零第三方依赖 · Python 3.9+**
 
-从 0 写的第一个可用版本。目标不是“不可逆加密”，而是：**混淆后代码照常运行，变量名、字符串、注释不再一眼看穿，且改名是 AST 级别的，不会把字符串里的单词或注释误改。**
+目标不是“不可逆加密”，而是：**混淆后代码照常运行，变量名、字符串、注释不再一眼看穿，且改名是 AST 级别的，不会把字符串里的单词或注释误改。**
+
+## v0.1alpha.2 相对 alpha 的增强
+
+- **字符串逐串加盐**：alpha 的全局 XOR 密钥 + 固定 `_pyobf_s` helper，一处泄露等于全部泄露。现在每串有自己的 4 字节盐，密钥是 `SHA256(master + salt)`，master 只以 `bytes([...])` 形式嵌在 helper 里；helper 名每个文件都不同，没有固定标记可 grep。
+- **整数混淆（level ≥ 2）**：`16` → `692 + -676` 这类确定性加法拆分，`match` 的字面模式、注解、小整数（<10）不碰。
+- **私有模块变量也改名（level ≥ 2）**：`_FACTOR = 10` 这类模块级私有变量进全项目统一映射，跨文件 `from cfg import _FACTOR` / `cfg._FACTOR` 一起改。
+- **标识符不再是固定模式**：alpha 是 `_o` + 8 位 hex，现在长度在 6–12 位之间变化。
+- **死代码不再是 `if False:`（level 3）**：改成不透明谓词（如 `if 79 * 37 % 7 == 5:`，按构造恒为假）加一个永不调用的函数。
 
 > 诚实声明：混淆 ≠ 加密。懂行的人用 `ast` / 反编译仍可还原逻辑。不要把密钥、密码放进要混淆的代码里指望它保密。
 
@@ -31,15 +39,15 @@ python /tmp/hello_obf.py
 | level | 做什么 | 默认 |
 |---|---|---|
 | 1 | 局部变量 / 循环 / with / except / 推导式变量重命名；删注释和 docstring | 默认 |
-| 2 | level 1 + 私有顶层 `def`/`class`（`_xxx`）重命名 + 字符串加密（XOR+base64，运行时解码） | — |
-| 3 | level 2 + 插入死代码（`if False:`，永不执行） | — |
+| 2 | level 1 + 私有顶层 `def`/`class`/变量（`_xxx`）重命名 + 逐串加盐字符串加密 + 整数混淆 | — |
+| 3 | level 2 + 不透明死代码（恒假谓词 + 永不调用的函数） | — |
 
-可单独开关：`--no-strings`、`--no-rename-top`、`--no-junk`、`--keep-docstrings`。
+可单独开关：`--no-strings`、`--no-ints`、`--no-rename-top`、`--no-junk`、`--keep-docstrings`。
 
 ## 它保证不改什么（安全规则）
 
 - **不改属性名**：`obj.attr`、`self.count`、`obj.method()` 原样保留。
-- **不改 import**：`import os`、`from x import y` 的绑定名保留；跨文件私有函数（`from helper import _helper`、`helper._helper`）在 level 2 用全项目统一映射一起改，`__all__` 也会同步更新。
+- **不改 import**：`import os`、`from x import y` 的绑定名保留；跨文件私有函数/变量（`from helper import _helper`、`helper._helper`、`cfg._FACTOR`）在 level 2 用全项目统一映射一起改，`__all__` 也会同步更新。
 - **不改内置函数和 dunder**：`len`、`print`、`__name__`、`__main__` 不动。
 - **不改函数参数（默认）**：关键字调用 `f(name="Bob")` 不会断。想改参数用实验性 `--rename-args`，它只改写同文件内直接调用的关键字参数。
 - **闭包 / global / nonlocal / 海象 / match / 推导式首个迭代器**都按 Python 作用域语义处理，见 `tests/test_transform.py`。
@@ -52,6 +60,7 @@ python /tmp/hello_obf.py
 -o / --output      输出：文件或目录。默认 输入名 + _obf
 --seed             种子。不给则随机生成并打印，用同一 seed 可复现同一输出
 --level 1|2|3      强度，默认 1
+--ints / --no-ints 混淆整数常量（level>=2 默认开启）
 --rename-args      实验性：重命名函数参数
 --keep-name NAME   永不重命名的标识符，可重复
 --exclude GLOB     排除文件，可重复，如 'test_*.py'
@@ -65,13 +74,13 @@ python /tmp/hello_obf.py
 
 ```
 pyobf/
-  __init__.py      版本号 0.1.0-alpha
+  __init__.py      版本号 0.1.0-alpha.2
   __main__.py      python -m pyobf 入口
   cli.py           argparse、退出码、输出目录保护
   obfuscator.py    发现文件、两遍式顶层映射、插入 helper/死代码、写盘
-  transform.py     AST 重命名器（作用域、推导式、import、关键字调用）
-  naming.py        确定性命名：sha256(seed + 作用域 + 原名)
-  strings.py       XOR + base64 字符串加解密与运行时 helper
+  transform.py     AST 重命名器（作用域、推导式、import、关键字调用、整数混淆）
+  naming.py        确定性命名：sha256(seed + 作用域 + 原名)，长度 6–12 位
+  strings.py       逐串加盐 XOR + base64 字符串加解密与运行时 helper
 tests/             unittest，无第三方依赖：python -m unittest discover -s tests -v
 examples/          hello.py、demo.py（混淆前后输出应一致）
 ```
@@ -82,9 +91,9 @@ examples/          hello.py、demo.py（混淆前后输出应一致）
 python -m unittest discover -s tests -v
 ```
 
-覆盖：字符串往返、命名确定性、混淆后运行输出一致、内置/属性/import 不动、闭包/global/match/海象、跨文件私有 import、关键字参数、语法错误、dry-run、CLI 退出码。
+覆盖：字符串往返与逐串盐、命名确定性、混淆后运行输出一致、内置/属性/import 不动、闭包/global/match/海象、跨文件私有 import（含私有模块变量）、整数混淆与 match 模式保护、无固定 helper 名、不透明死代码、关键字参数、语法错误、dry-run、CLI 退出码。共 29 个测试。
 
-## 已知限制（v0.1alpha，下一版再修）
+## 已知限制（v0.1alpha.2，下一版再修）
 
 1. 用 `ast.unparse` 重生成代码：**注释、空行、原格式会丢**，只保语义；`# type:` 注释、部分极端语法可能丢失。
 2. 不改文件名、不改模块名；`getattr(obj, "_helper")` 这类**字符串形式的动态属性名**不会跟着顶层改名走。
@@ -95,7 +104,7 @@ python -m unittest discover -s tests -v
 
 ## 下一步（v0.2 候选）
 
-- 控制流扁平化 / 不透明谓词、常量折叠后加密
+- 控制流扁平化、常量折叠后加密
 - 保留原格式的改名（tokenize 方式，不走 unparse）
 - `--keep-public-api`：按 `__all__` 自动保留公开接口
 - 字节码 / `.pyc` 输出模式

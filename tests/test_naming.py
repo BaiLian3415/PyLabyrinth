@@ -26,6 +26,13 @@ class TestNaming(unittest.TestCase):
         gen = NameGenerator("1")
         self.assertEqual(gen.generate("foo", "m:f"), gen.generate("foo", "m:f"))
 
+    def test_names_vary_in_length(self):
+        # Alpha.2: no single fixed `_o` + 8 hex pattern.
+        gen = NameGenerator("1")
+        names = {gen.generate(f"var{i}", "m:f") for i in range(30)}
+        self.assertTrue(all(n.startswith("_") and n[1:].isalnum() for n in names))
+        self.assertGreater(len({len(n) for n in names}), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

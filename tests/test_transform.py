@@ -92,6 +92,67 @@ class TestTransform(unittest.TestCase):
             with self.assertRaises(ObfuscateError):
                 obfuscate_project(input_path=src, output_path=tmp / "o.py", seed="1", level=1)
 
+    def test_int_obfuscation_output_identical(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", "print(100 + 250)\nprint(-42)\nprint([1, 2, 3][0])\n")
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="42", level=2)
+            text = out.read_text(encoding="utf-8")
+            self.assertNotIn("100 + 250", text)
+            res = run_py(out)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout, "350\n-42\n1\n")
+
+    def test_match_pattern_ints_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", "n = 100\nmatch n:\n    case 100:\n        print('hundred')\n    case _:\n        print('other')\n")
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="42", level=2)
+            text = out.read_text(encoding="utf-8")
+            self.assertIn("case 100:", text)
+            res = run_py(out)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "hundred")
+
+    def test_no_fixed_helper_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", 'print("hello world")\n')
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="42", level=2)
+            text = out.read_text(encoding="utf-8")
+            self.assertNotIn("_pyobf_s", text)
+            self.assertNotIn("hello world", text)
+            res = run_py(out)
+            self.assertEqual(res.stdout.strip(), "hello world")
+
+    def test_private_module_var_cross_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            srcdir = tmp / "src"
+            write(srcdir, "cfg.py", "_FACTOR = 10\ndef get():\n    return _FACTOR\n")
+            write(srcdir, "main.py", "from cfg import _FACTOR\nimport cfg\nprint(_FACTOR, cfg._FACTOR, cfg.get())\n")
+            out = tmp / "out"
+            obfuscate_project(input_path=srcdir, output_path=out, seed="99", level=2)
+            res = subprocess.run([sys.executable, "main.py"], cwd=out, capture_output=True, text=True, timeout=10)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "10 10 10")
+
+    def test_level3_opaque_junk_never_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", "print(12345)\n")
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="7", level=3)
+            text = out.read_text(encoding="utf-8")
+            self.assertNotIn("if False:", text)
+            self.assertIn("% 7 ==", text)  # opaque dead branch is present
+            res = run_py(out)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "12345")
+
     def test_dry_run_writes_nothing(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
