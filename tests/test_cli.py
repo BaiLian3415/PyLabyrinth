@@ -19,6 +19,23 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(cli("--help").returncode, 0)
         self.assertIn("0.1.0-alpha", cli("--version").stdout)
 
+    def test_direct_script_entry(self):
+        # Regression: `python pyobf/cli.py` and `cd pyobf && python cli.py`
+        # used to fail with "attempted relative import with no known
+        # parent package". Both must work, as must `python -m pyobf`.
+        r1 = subprocess.run(
+            [sys.executable, "pyobf/cli.py", "--version"],
+            cwd=ROOT, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertIn("0.1.0-alpha", r1.stdout)
+        r2 = subprocess.run(
+            [sys.executable, "cli.py", "--version"],
+            cwd=ROOT / "pyobf", capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertIn("0.1.0-alpha", r2.stdout)
+
     def test_missing_input(self):
         self.assertEqual(cli("-i", "no-such-file.py", "-o", "x.py").returncode, 2)
 

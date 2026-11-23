@@ -1,9 +1,9 @@
 """CLI for pyobf v0.1alpha.
 
-Usage:
-    python -m pyobf -i src -o dist
-    python -m pyobf -i app.py -o app_obf.py --level 2 --seed 42 --map map.json
-    python -m pyobf --help
+Usage (both work):
+    python -m pyobf -i src -o dist            # from the project root
+    python pyobf/cli.py -i src -o dist        # from the project root
+    python cli.py -i src -o dist              # from inside the pyobf/ folder
 """
 from __future__ import annotations
 
@@ -12,8 +12,18 @@ import random
 import sys
 from pathlib import Path
 
-from . import __version__
-from .obfuscator import ObfuscateError, obfuscate_project, write_mapping
+if __package__ in (None, ""):
+    # Executed as a plain script (e.g. `python pyobf/cli.py` or
+    # `cd pyobf && python cli.py`): there is no parent package, so
+    # relative imports would fail with "attempted relative import with
+    # no known parent package". Put the project root on sys.path and
+    # import as absolute package imports instead.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from pyobf import __version__
+    from pyobf.obfuscator import ObfuscateError, obfuscate_project, write_mapping
+else:
+    from . import __version__
+    from .obfuscator import ObfuscateError, obfuscate_project, write_mapping
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -108,3 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"完成：{len(result.files)} 个文件 -> {out}")
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

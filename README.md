@@ -9,8 +9,12 @@
 ## 快速开始
 
 ```bash
-# 单文件，默认 level 1
+# 单文件，默认 level 1（在项目根目录下运行）
 python -m pyobf -i examples/hello.py -o /tmp/hello_obf.py --seed 42
+
+# 下面两种写法也一样能用：
+python pyobf/cli.py -i examples/hello.py -o /tmp/hello_obf.py --seed 42
+cd pyobf && python cli.py -i ../examples/hello.py -o /tmp/hello_obf.py --seed 42
 
 # 整个目录，level 2
 python -m pyobf -i myproject -o myproject_obf --seed 42 --level 2 --map map.json
