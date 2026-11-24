@@ -1,4 +1,4 @@
-"""Orchestration for pyobf v0.1alpha.2: discover, two-pass rename, write."""
+"""Orchestration for pyobf v0.1alpha.3: discover, two-pass rename, write."""
 from __future__ import annotations
 
 import ast
@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .naming import NameGenerator
-from .strings import derive_master, helper_name_for, helper_source
+from .strings import bytes_helper_name_for, derive_master, helper_name_for, helper_source, helper_source_bytes
 from .transform import Renamer
 
 
@@ -27,6 +27,9 @@ class FileResult:
     renamed_top: int = 0
     strings_encrypted: int = 0
     ints_obfuscated: int = 0
+    bytes_encrypted: int = 0
+    attrs_renamed: int = 0
+    shuffled_defs: int = 0
     bytes_in: int = 0
     bytes_out: int = 0
 
@@ -108,12 +111,14 @@ def collect_top_maps(
     return maps
 
 
-def _insert_helper(tree: ast.Module, helper_name: str, master: bytes, mapping_values: set[str]) -> str:
-    """Insert the string-decoder after any ``__future__`` imports.
+def _insert_helper(tree: ast.Module, helper_name: str, source: str, mapping_values: set[str]) -> str:
+    """Insert a decoder (str or bytes) after any ``__future__`` imports.
 
     Returns the helper name actually used. If the deterministic name
     collides with a renamed identifier in this file (vanishingly rare,
     but checked), the call sites are rewritten to a suffixed name.
+    ``source`` must be the helper source for ``actual``; it is
+    regenerated here when a suffix is applied.
     """
     actual = helper_name
     suffix = 1
@@ -125,7 +130,9 @@ def _insert_helper(tree: ast.Module, helper_name: str, master: bytes, mapping_va
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id == helper_name:
                 node.id = actual
-    helper_tree = ast.parse(helper_source(actual, master))
+        # source was built for the unsuffixed name; rebuild it
+        source = source.replace(f"def {helper_name}(", f"def {actual}(", 1)
+    helper_tree = ast.parse(source)
     helper_def = helper_tree.body[0]
     idx = 0
     for i, stmt in enumerate(tree.body):
@@ -135,6 +142,71 @@ def _insert_helper(tree: ast.Module, helper_name: str, master: bytes, mapping_va
             break
     tree.body.insert(idx, helper_def)
     return actual
+
+
+def _def_time_names(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> set[str]:
+    """Names a def/class references at definition time (decorators,
+    defaults, bases, annotations). Body references do not count: the
+    body runs later, after every def is defined."""
+    names: set[str] = set()
+    parts: list[ast.AST] = list(node.decorator_list)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        parts.extend(node.args.defaults)
+        parts.extend(d for d in node.args.kw_defaults if d is not None)
+        if node.returns is not None:
+            parts.append(node.returns)
+        for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+            if arg.annotation is not None:
+                parts.append(arg.annotation)
+    else:
+        parts.extend(node.bases)
+        parts.extend(kw.value for kw in node.keywords)
+    for part in parts:
+        for sub in ast.walk(part):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                names.add(sub.id)
+    return names
+
+
+def _shuffle_top_defs(tree: ast.Module, seed: str, module: str) -> int:
+    """Shuffle independent top-level defs/class (level 3 only).
+
+    Only defs whose definition-time dependencies do not reference any
+    other top-level name are moved, and only among the slots of other
+    movable defs. If any top-level statement between/before the defs
+    references a top-level def (other than a trailing ``if __name__``
+    guard, which runs after all defs), shuffling is skipped for the
+    whole file. Returns how many defs changed position.
+    """
+    body = tree.body
+    def_idx = [i for i, s in enumerate(body) if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    if len(def_idx) < 2:
+        return 0
+    top_names = {body[i].name for i in def_idx}
+    last_def = def_idx[-1]
+    for i, stmt in enumerate(body):
+        if i in def_idx or i > last_def:
+            continue
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            continue
+        for sub in ast.walk(stmt):
+            if isinstance(sub, ast.Name) and sub.id in top_names:
+                return 0
+    movable = [i for i in def_idx if not (_def_time_names(body[i]) & top_names)]
+    if len(movable) < 2:
+        return 0
+    rng = random.Random(int(hashlib.sha256(f"{seed}\x00{module}\x00shuffle".encode()).hexdigest()[:8], 16))
+    defs = [body[i] for i in movable]
+    shuffled = defs[:]
+    rng.shuffle(shuffled)
+    if shuffled == defs:
+        return 0
+    moved = 0
+    for slot, node in zip(movable, shuffled):
+        if body[slot] is not node:
+            moved += 1
+        body[slot] = node
+    return moved
 
 
 def _junk_source(seed: str, module_name: str) -> str:
@@ -197,6 +269,8 @@ def obfuscate_project(
     exclude: list[str] | None = None,
     dry_run: bool = False,
     obfuscate_ints: bool | None = None,
+    rename_attrs: bool | None = None,
+    shuffle_top: bool | None = None,
 ) -> RunResult:
     if level not in (1, 2, 3):
         raise ObfuscateError("level 只能是 1、2、3")
@@ -208,6 +282,10 @@ def obfuscate_project(
         add_junk = level >= 3
     if obfuscate_ints is None:
         obfuscate_ints = level >= 2
+    if rename_attrs is None:
+        rename_attrs = level >= 2
+    if shuffle_top is None:
+        shuffle_top = level >= 3
 
     keep = set(keep_names or set())
     exclude = list(exclude or [])
@@ -246,6 +324,7 @@ def obfuscate_project(
             raise ObfuscateError(f"{rel}: 语法错误 {exc.msg} (行 {exc.lineno})") from exc
 
         helper_name = helper_name_for(str(seed), mod)
+        bytes_helper_name = bytes_helper_name_for(str(seed), mod)
         renamer = Renamer(
             seed=str(seed),
             name_gen=name_gen,
@@ -259,13 +338,17 @@ def obfuscate_project(
             keep_names=keep,
             master=master,
             helper_name=helper_name,
+            bytes_helper_name=bytes_helper_name,
             obfuscate_ints=obfuscate_ints,
+            rename_attrs=rename_attrs,
         )
         new_tree = renamer.transform(tree)
 
-        needs_helper = renamer.stats["strings_encrypted"] > 0
-        if needs_helper:
-            _insert_helper(new_tree, helper_name, master, set(renamer.mapping.values()))
+        shuffled = _shuffle_top_defs(new_tree, str(seed), mod) if shuffle_top else 0
+        if renamer.stats["strings_encrypted"] > 0:
+            _insert_helper(new_tree, helper_name, helper_source(helper_name, master), set(renamer.mapping.values()))
+        if renamer.stats["bytes_encrypted"] > 0:
+            _insert_helper(new_tree, bytes_helper_name, helper_source_bytes(bytes_helper_name, master), set(renamer.mapping.values()))
         if add_junk:
             junk_tree = ast.parse(_junk_source(str(seed), mod))
             # junk source is now several statements (unused function +
@@ -294,6 +377,9 @@ def obfuscate_project(
             renamed_top=renamer.stats["renamed_top"],
             strings_encrypted=renamer.stats["strings_encrypted"],
             ints_obfuscated=renamer.stats["ints_obfuscated"],
+            bytes_encrypted=renamer.stats["bytes_encrypted"],
+            attrs_renamed=renamer.stats["attrs_renamed"],
+            shuffled_defs=shuffled,
             bytes_in=len(text.encode("utf-8")),
             bytes_out=len(out_text.encode("utf-8")),
         )
@@ -309,7 +395,7 @@ def obfuscate_project(
 def mapping_payload(result: RunResult) -> dict:
     return {
         "tool": "pyobf",
-        "version": "0.1.0-alpha.2",
+        "version": "0.1.0-alpha.3",
         "seed": result.seed,
         "level": result.level,
         "warning": "此映射文件可用于调试还原，发布时不要随混淆产物一起分发。",

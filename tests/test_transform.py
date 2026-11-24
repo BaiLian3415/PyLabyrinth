@@ -140,6 +140,90 @@ class TestTransform(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertEqual(res.stdout.strip(), "10 10 10")
 
+    def test_private_attrs_renamed(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", '''class C:\n    _limit = 3\n    def __init__(self):\n        self._count = 0\n    def _bump(self):\n        self._count += 1\n        return self._count\n    def get(self):\n        return self._bump() + self._limit\nprint(C().get())\n''')
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="42", level=2)
+            text = out.read_text(encoding="utf-8")
+            self.assertNotIn("_count", text)
+            self.assertNotIn("_bump", text)
+            self.assertNotIn("_limit", text)
+            res = run_py(out)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "4")
+
+    def test_external_private_attr_not_renamed(self):
+        # Documented limit: obj._x where obj is not self/cls is left alone.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", "class C:\n    def __init__(self):\n        self._x = 5\nc = C()\nprint(c._x)\n")
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="42", level=2)
+            text = out.read_text(encoding="utf-8")
+            self.assertIn("c._x", text)
+
+    def test_bytes_encrypted(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", 'print(b"hello-bytes")\n')
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="42", level=2)
+            text = out.read_text(encoding="utf-8")
+            self.assertNotIn("hello-bytes", text)
+            res = run_py(out)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "b'hello-bytes'")
+
+    def test_long_string_split(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", 'print("abcdefghijklmnopqrstuvwxyz0123456789")\n')
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="42", level=2)
+            text = out.read_text(encoding="utf-8")
+            self.assertNotIn("abcdefghijklmnopqrstuvwxyz", text)
+            res = run_py(out)
+            self.assertEqual(res.stdout.strip(), "abcdefghijklmnopqrstuvwxyz0123456789")
+
+    def test_int_not_in_compiled_consts(self):
+        # Alpha.3: len()-based form must not constant-fold back to the
+        # original int in the compiled code object (recursively).
+        import dis
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", "print(2026 + 100000)\n")
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="42", level=2)
+            code = compile(out.read_text(encoding="utf-8"), str(out), "exec")
+            consts: set = set()
+
+            def collect(c):
+                consts.update(c.co_consts)
+                for sub in c.co_consts:
+                    if hasattr(sub, "co_consts"):
+                        collect(sub)
+
+            collect(code)
+            self.assertNotIn(2026, consts)
+            self.assertNotIn(100000, consts)
+            res = run_py(out)
+            self.assertEqual(res.stdout.strip(), "102026")
+
+    def test_shuffle_top_defs(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", "def aaa():\n    return 1\ndef bbb():\n    return 2\ndef ccc():\n    return 3\nprint(aaa(), bbb(), ccc())\n")
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="42", level=3)
+            text = out.read_text(encoding="utf-8")
+            order = [text.index("def aaa"), text.index("def bbb"), text.index("def ccc")]
+            self.assertNotEqual(order, sorted(order))
+            res = run_py(out)
+            self.assertEqual(res.stdout.strip(), "1 2 3")
+
     def test_level3_opaque_junk_never_runs(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

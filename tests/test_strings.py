@@ -1,13 +1,17 @@
 import unittest
 
 from pyobf.strings import (
+    bytes_helper_name_for,
+    decrypt_bytes,
     decrypt_str,
     derive_key,
     derive_master,
+    encrypt_bytes,
     encrypt_str,
     encrypt_str_indexed,
     helper_name_for,
     helper_source,
+    helper_source_bytes,
 )
 
 
@@ -48,6 +52,17 @@ class TestStrings(unittest.TestCase):
         self.assertEqual(ns[helper](enc), "secret-value")
         # master is embedded as bytes([...]), not as a hex string
         self.assertNotIn(master.hex(), helper_source(helper, master))
+
+    def test_bytes_roundtrip_and_helper(self):
+        master = derive_master("42")
+        data = b"secret-bytes-123"
+        enc = encrypt_bytes(data, master)
+        self.assertEqual(decrypt_bytes(enc, master), data)
+        helper = bytes_helper_name_for("42", "m")
+        self.assertNotEqual(helper, helper_name_for("42", "m"))
+        ns: dict = {}
+        exec(helper_source_bytes(helper, master), ns)
+        self.assertEqual(ns[helper](enc), data)
 
     def test_derive_key_backcompat(self):
         # Old callers passing derive_key() as the master still round-trip.

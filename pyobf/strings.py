@@ -48,6 +48,11 @@ def helper_name_for(seed: str, module: str) -> str:
     return "_" + digest[:10]
 
 
+def bytes_helper_name_for(seed: str, module: str) -> str:
+    digest = hashlib.sha256(f"{seed}\x00{module}\x00bytes-helper".encode("utf-8")).hexdigest()
+    return "_" + digest[:10]
+
+
 def _per_string_key(master: bytes, salt: bytes) -> bytes:
     return hashlib.sha256(master + salt).digest()
 
@@ -78,6 +83,25 @@ def decrypt_str(encoded: str, master: bytes) -> str:
     return plain.decode("utf-8")
 
 
+def encrypt_bytes(data: bytes, master: bytes, salt: bytes | None = None) -> str:
+    if salt is None:
+        salt = b"\x00\x00\x00\x00"
+    key = _per_string_key(master, salt)
+    xored = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+    return base64.b64encode(salt + xored).decode("ascii")
+
+
+def encrypt_bytes_indexed(data: bytes, master: bytes, seed: str, module: str, index: int) -> str:
+    return encrypt_bytes(data, master, make_salt(seed, module, index))
+
+
+def decrypt_bytes(encoded: str, master: bytes) -> bytes:
+    raw = base64.b64decode(encoded.encode("ascii"))
+    salt, data = raw[:4], raw[4:]
+    key = _per_string_key(master, salt)
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+
+
 def helper_source(helper_name: str, master: bytes) -> str:
     """Source of the runtime decoder, to be parsed and inserted as AST."""
     master_list = ", ".join(str(b) for b in master)
@@ -89,4 +113,18 @@ def helper_source(helper_name: str, master: bytes) -> str:
         f"    _r = _b64.b64decode(_s.encode(\"ascii\"))\n"
         f"    _k = _hl.sha256(_m + _r[:4]).digest()\n"
         f"    return bytes(_c ^ _k[_i % len(_k)] for _i, _c in enumerate(_r[4:])).decode(\"utf-8\")\n"
+    )
+
+
+def helper_source_bytes(helper_name: str, master: bytes) -> str:
+    """Same decoder, but returns bytes instead of a str (for b\"...\" literals)."""
+    master_list = ", ".join(str(b) for b in master)
+    return (
+        f"def {helper_name}(_s):\n"
+        f"    import base64 as _b64\n"
+        f"    import hashlib as _hl\n"
+        f"    _m = bytes([{master_list}])\n"
+        f"    _r = _b64.b64decode(_s.encode(\"ascii\"))\n"
+        f"    _k = _hl.sha256(_m + _r[:4]).digest()\n"
+        f"    return bytes(_c ^ _k[_i % len(_k)] for _i, _c in enumerate(_r[4:]))\n"
     )

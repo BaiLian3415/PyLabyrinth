@@ -1,8 +1,14 @@
-"""AST transformer for pyobf v0.1alpha.2.
+"""AST transformer for pyobf v0.1alpha.3.
 
-Safety-first rules (v0.1, kept in alpha.2):
-- Never rename attributes (``obj.attr``), imports, builtins, dunders,
-  decorators, or keyword-argument names of unknown callees.
+Safety-first rules (v0.1, kept in alpha.2/alpha.3):
+- Never rename public attributes (``obj.attr``), imports, builtins,
+  dunders, decorators, or keyword-argument names of unknown callees.
+  Alpha.3 adds one exception: *private* attributes (``self._x``,
+  ``cls._x``, private methods, class-body ``_x = ...``) are renamed
+  per-class at level >= 2, because they are only reachable through
+  the class itself. External ``obj._x`` access to a private attribute
+  is intentionally not rewritten and will break -- that is the
+  documented cost of renaming a private name.
 - Local variables / loop / with / except / comprehension variables are
   renamed per-function-scope, so shadowing and closures stay correct.
 - Function parameters are NOT renamed by default (keyword calls would
@@ -24,9 +30,13 @@ import hashlib
 import keyword
 
 from .naming import NameGenerator
-from .strings import HELPER_NAME, encrypt_str_indexed
+from .strings import HELPER_NAME, encrypt_bytes_indexed, encrypt_str_indexed
 
 _DUNDER_OK = ("self", "cls")
+
+
+def _is_private_attr(name: str) -> bool:
+    return name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
 
 
 class _Scope:
@@ -58,6 +68,8 @@ class Renamer(ast.NodeTransformer):
         helper_name: str = HELPER_NAME,
         obfuscate_ints: bool = False,
         master: bytes | None = None,
+        bytes_helper_name: str | None = None,
+        rename_attrs: bool = False,
     ):
         super().__init__()
         self.seed = seed
@@ -75,10 +87,13 @@ class Renamer(ast.NodeTransformer):
         self.master = master if master is not None else key
         self.key = self.master
         self.helper_name = helper_name
+        self.bytes_helper_name = bytes_helper_name or (helper_name + "_b")
         self.obfuscate_ints = obfuscate_ints
+        self.rename_attrs = rename_attrs
 
         self.scopes: list[_Scope] = []
         self._path: list[str] = []  # qualified function/class names
+        self._class_attrs: list[dict[str, str]] = []  # per-class private attr map
         self._in_annotation = 0
         self._in_match = 0
         self._in_all = False
@@ -86,7 +101,7 @@ class Renamer(ast.NodeTransformer):
         self._int_index = 0
         self.imported_modules: dict[str, str] = {}  # alias -> module name
 
-        self.stats = {"renamed_locals": 0, "renamed_top": 0, "strings_encrypted": 0, "ints_obfuscated": 0}
+        self.stats = {"renamed_locals": 0, "renamed_top": 0, "strings_encrypted": 0, "ints_obfuscated": 0, "bytes_encrypted": 0, "attrs_renamed": 0}
         # original -> obfuscated, scope-qualified keys for the map file
         self.mapping: dict[str, str] = {}
         # simple function name -> {param original: param obfuscated}
@@ -127,7 +142,11 @@ class Renamer(ast.NodeTransformer):
             return name
         cur = self._current()
         if cur.kind == "class":
-            return name  # class-body assignment = attribute, not a local
+            # class-body assignment = attribute: rename only if it is in
+            # this class's private-attribute map (alpha.3, level >= 2)
+            if name in cur.bindings:
+                return cur.bindings[name]
+            return name
         if cur.kind == "module":
             if self.rename_top and name in self.top_map:
                 return self.top_map[name]
@@ -223,7 +242,14 @@ class Renamer(ast.NodeTransformer):
             self.stats["renamed_top"] += 1
             self.mapping[f"{self.module_name}:{orig_name}"] = node.name
         elif is_class_level:
-            pass  # method name is an attribute; keep it
+            # private method: rename via the enclosing class's attr map
+            if (
+                self.rename_attrs
+                and self._class_attrs
+                and orig_name in self._class_attrs[-1]
+            ):
+                node.name = self._class_attrs[-1][orig_name]
+            # public method name is an attribute; keep it
         elif not is_module_level:
             node.name = self._define(orig_name)
 
@@ -299,6 +325,47 @@ class Renamer(ast.NodeTransformer):
         self.scopes.pop()
         return node
 
+    def _collect_class_attrs(self, node: ast.ClassDef) -> dict[str, str]:
+        """Private attributes of one class: data attrs, private methods,
+        and every ``self._x`` / ``cls._x`` used anywhere inside it."""
+        if not self.rename_attrs:
+            return {}
+        scope = f"{self.module_name}:{node.name}:attrs"
+        attrs: dict[str, str] = {}
+
+        def _add(name: str) -> None:
+            if _is_private_attr(name) and name not in attrs:
+                attrs[name] = self.name_gen.generate(name, scope)
+
+        def _names_from_target(target: ast.AST) -> list[str]:
+            if isinstance(target, ast.Name):
+                return [target.id]
+            if isinstance(target, (ast.Tuple, ast.List)):
+                out: list[str] = []
+                for elt in target.elts:
+                    out.extend(_names_from_target(elt))
+                return out
+            return []
+
+        for stmt in node.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _add(stmt.name)
+            elif isinstance(stmt, ast.Assign):
+                for tgt in stmt.targets:
+                    for n in _names_from_target(tgt):
+                        _add(n)
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                _add(stmt.target.id)
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
+                if sub.value.id in ("self", "cls"):
+                    _add(sub.attr)
+        if attrs:
+            self.stats["attrs_renamed"] += len(attrs)
+            for orig, obf in attrs.items():
+                self.mapping[f"{self.module_name}:{node.name}:attr:{orig}"] = obf
+        return attrs
+
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
         orig_name = node.name
         is_module_level = len(self.scopes) == 1 and self.scopes[0].kind == "module"
@@ -316,11 +383,15 @@ class Renamer(ast.NodeTransformer):
         node.bases = [self.visit(b) for b in node.bases]
         node.keywords = [self.visit(k) for k in node.keywords]
 
+        attr_map = self._collect_class_attrs(node)
         self.scopes.append(_Scope("class"))
+        self.scopes[-1].bindings.update(attr_map)
+        self._class_attrs.append(attr_map)
         self._path.append(orig_name)
         node.body = self._strip_docstring(node.body)
         node.body = [self.visit(stmt) for stmt in node.body]
         self._path.pop()
+        self._class_attrs.pop()
         self.scopes.pop()
         return node
 
@@ -520,12 +591,19 @@ class Renamer(ast.NodeTransformer):
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.Attribute:
         node.value = self.visit(node.value)
+        if isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
+            # private attribute / method of the enclosing class
+            for attr_map in reversed(self._class_attrs):
+                if node.attr in attr_map:
+                    node.attr = attr_map[node.attr]
+                    break
+            return node
         if isinstance(node.value, ast.Name) and node.value.id in self.imported_modules:
             mod = self.imported_modules[node.value.id]
             top = self.global_top_maps.get(mod, {})
             if node.attr in top:
                 node.attr = top[node.attr]
-        # never rename the attribute itself otherwise
+        # never rename any other attribute
         return node
 
     def visit_Call(self, node: ast.Call) -> ast.Call:
@@ -573,22 +651,63 @@ class Renamer(ast.NodeTransformer):
         return node
 
     def _obfuscate_int(self, node: ast.Constant) -> ast.AST:
+        """Replace an int literal with a non-constant-foldable expression.
+
+        Alpha.2 used ``n = a + b`` with two int literals. That is trivially
+        undone: CPython constant-folds it at compile time, so the .pyc
+        contains ``n`` again. Alpha.3 uses ``len("xxx...") * k + r``:
+        ``len()`` is a runtime call, so no constant folding happens and
+        the compiled code never contains ``n`` as a literal.
+        If a local variable shadows ``len`` in this scope, fall back to
+        the alpha.2 add-split (still correct, just foldable).
+        """
         n = node.value
         assert type(n) is int
         digest = hashlib.sha256(
             f"{self.seed}\x00{self.module_name}\x00int\x00{n}\x00{self._int_index}".encode("utf-8")
         ).hexdigest()
         self._int_index += 1
-        # deterministic split n = a + b, a in [-5000, 5000]
-        a = int(digest[:4], 16) % 10001 - 5000
-        b = n - a
         self.stats["ints_obfuscated"] += 1
+        if self._lookup("len") is not None:
+            a = int(digest[:4], 16) % 10001 - 5000
+            expr: ast.AST = ast.BinOp(
+                left=ast.Constant(value=a),
+                op=ast.Add(),
+                right=ast.Constant(value=n - a),
+            )
+            return ast.copy_location(expr, node)
+        sign = -1 if n < 0 else 1
+        m = abs(n)
+        max_len = min(8, max(3, m // 2))
+        a_len = 3 if max_len <= 3 else 3 + int(digest[:2], 16) % (max_len - 2)
+        k, r = divmod(m, a_len)
         expr = ast.BinOp(
-            left=ast.Constant(value=a),
+            left=ast.BinOp(
+                left=ast.Call(
+                    func=ast.Name(id="len", ctx=ast.Load()),
+                    args=[ast.Constant(value="x" * a_len)],
+                    keywords=[],
+                ),
+                op=ast.Mult(),
+                right=ast.Constant(value=k),
+            ),
             op=ast.Add(),
-            right=ast.Constant(value=b),
+            right=ast.Constant(value=r),
         )
+        if sign < 0:
+            expr = ast.UnaryOp(op=ast.USub(), operand=expr)
         return ast.copy_location(expr, node)
+
+    def _str_call(self, text: str) -> ast.Call:
+        assert self.master is not None
+        encoded = encrypt_str_indexed(text, self.master, self.seed, self.module_name, self._str_index)
+        self._str_index += 1
+        self.stats["strings_encrypted"] += 1
+        return ast.Call(
+            func=ast.Name(id=self.helper_name, ctx=ast.Load()),
+            args=[ast.Constant(value=encoded)],
+            keywords=[],
+        )
 
     def visit_Constant(self, node: ast.Constant) -> ast.AST:
         # ints first (bool is a subclass of int: check exact type)
@@ -600,6 +719,23 @@ class Renamer(ast.NodeTransformer):
             if abs(node.value) < 10:
                 return node  # 0/1/2/-1 and small indices stay readable
             return self._obfuscate_int(node)
+        if isinstance(node.value, bytes):
+            if not self.encrypt_strings:
+                return node
+            if self._in_annotation > 0 or self._in_match > 0:
+                return node
+            if len(node.value) < 4:
+                return node
+            assert self.master is not None
+            encoded = encrypt_bytes_indexed(node.value, self.master, self.seed, self.module_name, self._str_index)
+            self._str_index += 1
+            self.stats["bytes_encrypted"] += 1
+            call = ast.Call(
+                func=ast.Name(id=self.bytes_helper_name, ctx=ast.Load()),
+                args=[ast.Constant(value=encoded)],
+                keywords=[],
+            )
+            return ast.copy_location(call, node)
         if not isinstance(node.value, str):
             return node
         if self._in_annotation > 0 or self._in_match > 0:
@@ -614,13 +750,14 @@ class Renamer(ast.NodeTransformer):
             if text != node.value:
                 return ast.Constant(value=text)
             return node
-        assert self.master is not None
-        encoded = encrypt_str_indexed(text, self.master, self.seed, self.module_name, self._str_index)
-        self._str_index += 1
-        self.stats["strings_encrypted"] += 1
-        call = ast.Call(
-            func=ast.Name(id=self.helper_name, ctx=ast.Load()),
-            args=[ast.Constant(value=encoded)],
-            keywords=[],
-        )
+        if len(text) >= 20:
+            # Long strings are split into two independently salted
+            # chunks joined with `+`: no single payload holds the
+            # whole string, and the two salts differ.
+            split = len(text) // 2
+            left = self._str_call(text[:split])
+            right = self._str_call(text[split:])
+            expr = ast.BinOp(left=left, op=ast.Add(), right=right)
+            return ast.copy_location(expr, node)
+        call = self._str_call(text)
         return ast.copy_location(call, node)

@@ -17,7 +17,7 @@ def cli(*args, cwd=None):
 class TestCLI(unittest.TestCase):
     def test_help_and_version(self):
         self.assertEqual(cli("--help").returncode, 0)
-        self.assertIn("0.1.0-alpha.2", cli("--version").stdout)
+        self.assertIn("0.1.0-alpha.3", cli("--version").stdout)
 
     def test_direct_script_entry(self):
         # Regression: `python pyobf/cli.py` and `cd pyobf && python cli.py`
@@ -28,13 +28,13 @@ class TestCLI(unittest.TestCase):
             cwd=ROOT, capture_output=True, text=True, timeout=15,
         )
         self.assertEqual(r1.returncode, 0, r1.stderr)
-        self.assertIn("0.1.0-alpha.2", r1.stdout)
+        self.assertIn("0.1.0-alpha.3", r1.stdout)
         r2 = subprocess.run(
             [sys.executable, "cli.py", "--version"],
             cwd=ROOT / "pyobf", capture_output=True, text=True, timeout=15,
         )
         self.assertEqual(r2.returncode, 0, r2.stderr)
-        self.assertIn("0.1.0-alpha.2", r2.stdout)
+        self.assertIn("0.1.0-alpha.3", r2.stdout)
 
     def test_missing_input(self):
         self.assertEqual(cli("-i", "no-such-file.py", "-o", "x.py").returncode, 2)
