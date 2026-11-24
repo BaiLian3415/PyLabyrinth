@@ -250,6 +250,25 @@ class TestTransform(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.strip(), "42")
 
+    def test_renamer_pre_scan_use_before_store(self):
+        # regression (alpha.6): control-flow flattening shuffles the
+        # dispatcher branches, so a use can precede its assignment in
+        # source order. The renamer must still rename every occurrence
+        # of the local consistently (Python scoping: any assignment in
+        # a function makes the name local throughout it).
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", "def f(a):\n    if a:\n        return x\n    x = 1\n    return x\nprint(f(False))\n")
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="42", level=1)
+            text = out.read_text(encoding="utf-8")
+            # the bare name x must not survive anywhere in the output
+            self.assertNotIn("return x", text)
+            self.assertNotIn("x = 1", text)
+            r = run_py(out)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "1")
+
     def test_vmp_off_at_level2(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

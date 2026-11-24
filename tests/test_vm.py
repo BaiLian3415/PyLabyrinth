@@ -2,17 +2,28 @@ import ast
 import base64
 import unittest
 
-from pyobf.vm import _Compiler, apply_vmp, executor_source
+from pyobf.vm import (
+    _Compiler,
+    _xor_stream,
+    apply_vmp,
+    executor_source,
+    key_for,
+    perm_for,
+)
 
 
 def run_vm_src(src: str, func_name: str, args, globs=None):
+    # full alpha.6 path: per-file perm + sealed payload
+    perm = perm_for("42", "m")
+    key_int = key_for("42", "m")
     tree = ast.parse(src)
     func = next(
         n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == func_name
     )
-    payload = _Compiler(func, {}, {}, set()).compile()
+    payload = _Compiler(func, {}, {}, set(), perm=perm, key_int=key_int,
+                        seed="42", module="m").compile()
     ns: dict = {}
-    exec(executor_source("_vm_exec"), ns)
+    exec(executor_source("_vm_exec", perm, key_int), ns)
     g = dict(globals())
     g.update(globs or {})
     return ns["_vm_exec"](base64.b64encode(payload).decode(), args, g)
@@ -59,6 +70,47 @@ class TestVM(unittest.TestCase):
         src2 = "def f(o):\n    o.x = 7\n    return o.x * 2\n"
         self.assertEqual(run_vm_src(src2, "f", (obj,)), 14)
 
+    def test_payload_is_sealed_and_permuted(self):
+        # alpha.6: the base64 payload must not parse as a plain payload
+        # (XOR + checksum), and different seeds must permute opcodes.
+        src = "def f(a, b):\n    return a + b\n"
+        tree = ast.parse(src)
+        func = tree.body[0]
+        perm = perm_for("42", "m")
+        key_int = key_for("42", "m")
+        payload = _Compiler(func, {}, {}, set(), perm=perm, key_int=key_int,
+                            seed="42", module="m").compile()
+        raw = payload  # compile() returns sealed bytes, not base64
+        # sealed bytes must not parse as a plain payload: the header
+        # only becomes sane after XOR-decrypting and stripping the
+        # 4-byte checksum
+        import struct
+        plain = _xor_stream(raw, key_int)
+        n, c, _l = struct.unpack(">HHH", plain[4:10])
+        self.assertGreater(n, 0)
+        self.assertGreaterEqual(c, 0)
+        self.assertEqual((n, c, _l), struct.unpack(">HHH", plain[4:10]))
+        garbage = struct.unpack(">HHH", raw[4:10])
+        self.assertNotEqual(garbage, (n, c, _l))
+        self.assertNotEqual(perm_for("42", "m"), perm_for("43", "m"))
+        self.assertNotEqual(perm, list(range(26)))
+        # tampering is detected by the checksum
+        ns: dict = {}
+        exec(executor_source("_vm_exec", perm, key_int), ns)
+        bad = bytearray(raw)
+        bad[10] ^= 0xFF
+        with self.assertRaises(ValueError):
+            ns["_vm_exec"](base64.b64encode(bytes(bad)).decode(), (1, 2), {})
+
+    def test_nops_present(self):
+        src = "def f(n):\n    t = 0\n    for i in range(n):\n        t += i\n    return t\n"
+        tree = ast.parse(src)
+        func = tree.body[0]
+        comp = _Compiler(func, {}, {}, set(), seed="42", module="m")
+        comp.compile()
+        from pyobf.vm import OP_NOP
+        self.assertGreater(sum(1 for op, _ in comp.code if op == OP_NOP), 0)
+
     def test_apply_vmp_rejects_unsupported(self):
         # try/except, comprehension, nested def: left alone, count 0
         src = (
@@ -75,7 +127,7 @@ class TestVM(unittest.TestCase):
             "    return inner(x)\n"
         )
         tree = ast.parse(src)
-        count, name = apply_vmp(tree, "1", "m", {}, {}, set())
+        count, name, _perm, _key = apply_vmp(tree, "1", "m", {}, {}, set())
         self.assertEqual(count, 0)
         self.assertIsNone(name)
         self.assertEqual(len(tree.body), 3)
@@ -83,7 +135,7 @@ class TestVM(unittest.TestCase):
     def test_apply_vmp_accepts_simple(self):
         src = "def f(a, b):\n    return a + b\n"
         tree = ast.parse(src)
-        count, name = apply_vmp(tree, "1", "m", {}, {}, set())
+        count, name, _perm, _key = apply_vmp(tree, "1", "m", {}, {}, set())
         self.assertEqual(count, 1)
         self.assertIsNotNone(name)
         # stub keeps the name and a single return

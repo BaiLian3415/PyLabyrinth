@@ -1,4 +1,4 @@
-"""Orchestration for pyobf v0.1alpha.4: discover, two-pass rename, write."""
+"""Orchestration for pyobf v0.1alpha.6: discover, two-pass rename, write."""
 from __future__ import annotations
 
 import ast
@@ -9,6 +9,7 @@ import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .controlflow import apply_controlflow
 from .naming import NameGenerator
 from .strings import bytes_helper_name_for, derive_master, helper_name_for, helper_source, helper_source_bytes
 from .transform import Renamer
@@ -32,6 +33,7 @@ class FileResult:
     attrs_renamed: int = 0
     shuffled_defs: int = 0
     vm_functions: int = 0
+    cf_functions: int = 0
     bytes_in: int = 0
     bytes_out: int = 0
 
@@ -314,6 +316,7 @@ def obfuscate_project(
     rename_attrs: bool | None = None,
     shuffle_top: bool | None = None,
     vmp: bool | None = None,
+    cf: bool | None = None,
 ) -> RunResult:
     if level not in (1, 2, 3):
         raise ObfuscateError("level 只能是 1、2、3")
@@ -331,6 +334,8 @@ def obfuscate_project(
         shuffle_top = level >= 3
     if vmp is None:
         vmp = level >= 3
+    if cf is None:
+        cf = level >= 3
 
     keep = set(keep_names or set())
     exclude = list(exclude or [])
@@ -375,9 +380,19 @@ def obfuscate_project(
         # of the payload, int obfuscation of nothing).
         vm_count = 0
         vm_exec_name: str | None = None
+        vm_perm: list[int] | None = None
+        vm_key = 0
         if vmp:
             gmap, amap, ialiases = _vm_name_maps(tree, mod, top_maps)
-            vm_count, vm_exec_name = apply_vmp(tree, str(seed), mod, gmap, amap, ialiases)
+            vm_count, vm_exec_name, vm_perm, vm_key = apply_vmp(tree, str(seed), mod, gmap, amap, ialiases)
+
+        # Control-flow obfuscation runs after VMP (VM stubs are
+        # single-statement and are skipped) and before the renamer,
+        # so the state variable and all locals are renamed
+        # consistently by the renamer afterwards.
+        cf_count = 0
+        if cf:
+            cf_count = apply_controlflow(tree, str(seed), mod)
 
         helper_name = helper_name_for(str(seed), mod)
         bytes_helper_name = bytes_helper_name_for(str(seed), mod)
@@ -406,7 +421,7 @@ def obfuscate_project(
         if renamer.stats["bytes_encrypted"] > 0:
             _insert_helper(new_tree, bytes_helper_name, helper_source_bytes(bytes_helper_name, master), set(renamer.mapping.values()))
         if vm_count > 0 and vm_exec_name is not None:
-            _insert_helper(new_tree, vm_exec_name, executor_source(vm_exec_name), set(renamer.mapping.values()))
+            _insert_helper(new_tree, vm_exec_name, executor_source(vm_exec_name, vm_perm, vm_key), set(renamer.mapping.values()))
         if add_junk:
             junk_tree = ast.parse(_junk_source(str(seed), mod))
             # junk source is now several statements (unused function +
@@ -439,6 +454,7 @@ def obfuscate_project(
             attrs_renamed=renamer.stats["attrs_renamed"],
             shuffled_defs=shuffled,
             vm_functions=vm_count,
+            cf_functions=cf_count,
             bytes_in=len(text.encode("utf-8")),
             bytes_out=len(out_text.encode("utf-8")),
         )
@@ -454,7 +470,7 @@ def obfuscate_project(
 def mapping_payload(result: RunResult) -> dict:
     return {
         "tool": "pyobf",
-        "version": "0.1.0-alpha.4",
+        "version": "0.1.0-alpha.6",
         "seed": result.seed,
         "level": result.level,
         "warning": "此映射文件可用于调试还原，发布时不要随混淆产物一起分发。",

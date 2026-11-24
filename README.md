@@ -1,8 +1,22 @@
 # pyobf — 纯 CLI 的 Python 代码混淆器
 
-**版本：v0.1alpha.4 · 纯标准库，零第三方依赖 · Python 3.9+**
+**版本：v0.1alpha.6 · 纯标准库，零第三方依赖 · Python 3.9+**
 
 目标不是“不可逆加密”，而是：**混淆后代码照常运行，变量名、字符串、注释不再一眼看穿，且改名是 AST 级别的，不会把字符串里的单词或注释误改。**
+
+## v0.1alpha.6 相对 alpha.4 的增强：VM 复杂度 + 控制流混淆
+
+**VM 复杂度（alpha.6）：**
+- **每文件操作码置换**：操作码编号按 seed + 模块名随机打乱，同一个逻辑操作在不同文件里是不同的数字；解释器里嵌着对应的逆置换表。
+- **载荷整体加密**：整段载荷（指令 + 常量）用 LCG 密钥流 XOR（密钥由 seed + 模块名派生），前面再加 4 字节 SHA256 校验和；解释器先解密、验签，再执行，改过一个字节就报 `bad vm payload`。直接 base64 解出来是一堆乱码，看不到操作码也看不到常量。
+- **NOP 垃圾指令**：字节码里插 2–5 条 NOP（跳转目标自动修正），指令流比真实逻辑长。
+
+**控制流混淆（level 3 默认开启，`--cf` / `--no-cf`）：**
+- **状态机扁平化**：函数体被拆成若干块，每块一个状态号，整个函数变成 `while True:` + `if _state == ...` 分发器；`if` 的条件单独成块，跳转到 then/else 状态；`elif` 分支顺序打乱，从上往下读看不出执行顺序。循环、`try`/`with`、嵌套函数按整块处理，内部逻辑不动。
+- **分支取反**：`if cond: A else: B` 一半概率改成 `if not cond: B else: A`，条件按规则取反（`==`↔`!=`、`<`↔`>=`、德摩根、`not` 解包）。
+- **while 改写**：`while cond:` 一半概率改成 `while True: if not cond: break`，循环条件不再出现在 `while` 头上。
+- **安全回退**：含 `yield`、`global`/`nonlocal` 的函数不扁平化；VM 掉的函数（只剩一个 `return` 的 stub）不重复扁平化。
+- **附带修了一个重命名器的潜 bug**：重命名器原来是单遍遍历，用在赋值之前在源码里出现会漏改名（扁平化打乱分支顺序后正好会触发）；现在进函数时先预扫本作用域的所有赋值名，改名与源码顺序无关。测试里有回归用例。
 
 ## v0.1alpha.4 相对 alpha.3 的增强：虚拟机保护（VMP）
 
@@ -54,9 +68,9 @@ python /tmp/hello_obf.py
 |---|---|---|
 | 1 | 局部变量 / 循环 / with / except / 推导式变量重命名；删注释和 docstring | 默认 |
 | 2 | level 1 + 私有顶层 `def`/`class`/变量和私有属性重命名 + 逐串加盐字符串与 bytes 加密（长串拆分）+ 不可折叠整数混淆 | — |
-| 3 | level 2 + 不透明死代码（恒假谓词 + 永不调用的函数）+ 顶层函数乱序 + 虚拟机保护（VMP） | — |
+| 3 | level 2 + 不透明死代码（恒假谓词 + 永不调用的函数）+ 顶层函数乱序 + 虚拟机保护（VMP）+ 控制流混淆 | — |
 
-可单独开关：`--no-strings`、`--no-ints`、`--no-rename-top`、`--no-attrs`、`--no-shuffle`、`--no-vmp`、`--no-junk`、`--keep-docstrings`。
+可单独开关：`--no-strings`、`--no-ints`、`--no-rename-top`、`--no-attrs`、`--no-shuffle`、`--no-vmp`、`--no-cf`、`--no-junk`、`--keep-docstrings`。
 
 ## 它保证不改什么（安全规则）
 
@@ -78,6 +92,7 @@ python /tmp/hello_obf.py
 --attrs / --no-attrs 重命名私有属性（level>=2 默认开启）
 --shuffle / --no-shuffle 打乱顶层函数顺序（level 3 默认开启）
 --vmp / --no-vmp 虚拟机保护（level 3 默认开启）
+--cf / --no-cf 控制流混淆（level 3 默认开启）
 --rename-args      实验性：重命名函数参数
 --keep-name NAME   永不重命名的标识符，可重复
 --exclude GLOB     排除文件，可重复，如 'test_*.py'
@@ -91,12 +106,13 @@ python /tmp/hello_obf.py
 
 ```
 pyobf/
-  __init__.py      版本号 0.1.0-alpha.4
+  __init__.py      版本号 0.1.0-alpha.6
   __main__.py      python -m pyobf 入口
   cli.py           argparse、退出码、输出目录保护
   obfuscator.py    发现文件、两遍式顶层映射、插入 helper/死代码/VM 解释器、顶层乱序、写盘
-  transform.py     AST 重命名器（作用域、推导式、import、关键字调用、私有属性、整数混淆）
-  vm.py            VMP：把函数编译成自定义栈式 VM 字节码 + 内嵌解释器
+  transform.py     AST 重命名器（作用域、推导式、import、关键字调用、私有属性、整数混淆，进函数时预扫赋值名）
+  vm.py            VMP：把函数编译成自定义栈式 VM 字节码 + 内嵌解释器（操作码置换、载荷 XOR + 校验和、NOP）
+  controlflow.py   控制流混淆：分支取反、while 改写、状态机扁平化
   naming.py        确定性命名：sha256(seed + 作用域 + 原名)，长度 6–12 位
   strings.py       逐串加盐 XOR + base64 字符串/bytes 加解密与运行时 helper
 tests/             unittest，无第三方依赖：python -m unittest discover -s tests -v
@@ -109,9 +125,9 @@ examples/          hello.py、demo.py（混淆前后输出应一致）
 python -m unittest discover -s tests -v
 ```
 
-覆盖：字符串/bytes 往返与逐串盐、命名确定性、混淆后运行输出一致、内置/公开属性/import 不动、私有属性改名、闭包/global/match/海象、跨文件私有 import（含私有模块变量）、整数混淆与 match 模式保护及编译后常量检查、长串拆分、顶层乱序、VMP（VM 单元测试 + 混淆后输出一致 + 跨文件私有调用 + 默认参数）、无固定 helper 名、不透明死代码、关键字参数、语法错误、dry-run、CLI 退出码。共 50 个测试。
+覆盖：字符串/bytes 往返与逐串盐、命名确定性、混淆后运行输出一致、内置/公开属性/import 不动、私有属性改名、闭包/global/match/海象、跨文件私有 import（含私有模块变量）、整数混淆与 match 模式保护及编译后常量检查、长串拆分、顶层乱序、VMP（VM 单元测试 + 载荷密封与置换 + 篡改检测 + NOP + 混淆后输出一致 + 跨文件私有调用 + 默认参数）、控制流（扁平化/分支取反/while 改写 + 生成器与 global 不扁平化 + 用在赋值之前的改名回归）、无固定 helper 名、不透明死代码、关键字参数、语法错误、dry-run、CLI 退出码。共 59 个测试。
 
-## 已知限制（v0.1alpha.4，下一版再修）
+## 已知限制（v0.1alpha.6，下一版再修）
 
 1. 用 `ast.unparse` 重生成代码：**注释、空行、原格式会丢**，只保语义；`# type:` 注释、部分极端语法可能丢失。
 2. 不改文件名、不改模块名；`getattr(obj, "_helper")` 这类**字符串形式的动态属性名**不会跟着顶层改名走。
@@ -120,11 +136,12 @@ python -m unittest discover -s tests -v
 5. `--rename-args` 跨文件关键字调用、通过变量间接调用的函数，关键字参数可能失效，默认关闭。
 6. 只支持 UTF-8 的 `.py`；语法错误的文件会直接报错退出，不跳过。
 7. 类外面直接碰私有属性（`obj._x`、`getattr(obj, "_x")`）不会跟着私有属性改名走，level ≥ 2 下这类代码会失效；模块级变量遮住 `len` 时整数混淆会回退到加法拆分。
-8. VMP 只做顶层函数，类方法、嵌套函数不在内；VM 里的函数调用仍走正常 Python 调用（解释器本身是 Python 写的，速度比原生慢，热路径别用 VMP）；VM 载荷里的字符串/整数以 base64 + 加密形式存放，不是加密算法，懂解释器的人仍可解码。
+8. VMP 只做顶层函数，类方法、嵌套函数不在内；VM 里的函数调用仍走正常 Python 调用（解释器本身是 Python 写的，速度比原生慢，热路径别用 VMP）；VM 载荷以 base64 + XOR + 校验和存放，不是加密算法，懂解释器的人仍可解码（但要先拿到每文件的置换表和密钥）。
+9. 控制流扁平化会把函数体包进 `while True:` 分发器，函数变长、变慢，热路径别用 `--cf`；含 `yield`、`global`/`nonlocal` 的函数不扁平化。
 
 ## 下一步（v0.2 候选）
 
-- VMP 扩展到类方法、控制流扁平化（状态机分发，限简单函数）
+- VMP 扩展到类方法
 - 保留原格式的改名（tokenize 方式，不走 unparse）
 - `--keep-public-api`：按 `__all__` 自动保留公开接口
 - 字节码 / `.pyc` 输出模式

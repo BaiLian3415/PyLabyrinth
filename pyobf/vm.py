@@ -1,4 +1,14 @@
-"""VMP for pyobf v0.1alpha.4: compile a simple function to custom bytecode.
+"""VMP for pyobf v0.1alpha.6: compile a simple function to custom bytecode.
+
+Alpha.6 hardens the VM itself:
+- opcode numbers are permuted per file (seed + module), so the same
+  logical op has a different numeric value in every file;
+- the whole payload is XORed with an LCG key stream (key derived
+  from seed + module) and carries a SHA256 checksum, so the payload
+  bytes reveal neither opcodes nor constants, and tampering is
+  detected before execution;
+- junk NOP instructions are inserted into the bytecode (jump targets
+  adjusted), so the instruction stream is longer than the logic.
 
 A function that fits the supported subset is replaced by a stub that
 calls the embedded stack-VM interpreter with a base64 payload. The
@@ -28,6 +38,7 @@ from __future__ import annotations
 import ast
 import base64
 import hashlib
+import random
 import struct
 
 # opcodes
@@ -56,6 +67,34 @@ OP_STORE_SUBSCR = 21
 OP_DUP_TOP_TWO = 22
 OP_UNPACK_SEQ = 23
 OP_BUILD_SLICE = 24
+OP_NOP = 25
+
+N_OPS = 26
+_JUMP_OPS = frozenset({OP_POP_JUMP_IF_FALSE, OP_JUMP, OP_POP_JUMP_IF_TRUE, OP_FOR_ITER})
+
+
+def perm_for(seed: str, module: str) -> list[int]:
+    """Per-file opcode permutation: perm[logical op] = numeric op."""
+    rng = random.Random(int(hashlib.sha256(f"{seed}\x00{module}\x00vm-perm".encode()).hexdigest()[:8], 16))
+    perm = list(range(N_OPS))
+    rng.shuffle(perm)
+    return perm
+
+
+def key_for(seed: str, module: str) -> int:
+    """Per-file payload key (non-zero, 31-bit for the LCG stream)."""
+    key = int(hashlib.sha256(f"{seed}\x00{module}\x00vm-key".encode()).hexdigest()[:8], 16) & 0x7FFFFFFF
+    return key or 0x5EED123
+
+
+def _xor_stream(data: bytes, key_int: int) -> bytes:
+    """LCG key stream (its own inverse). Must match the interpreter."""
+    out = bytearray(data)
+    state = key_int & 0x7FFFFFFF
+    for i in range(len(out)):
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+        out[i] ^= (state >> 16) & 0xFF
+    return bytes(out)
 
 _BINOPS = {
     ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.FloorDiv: 3, ast.Div: 4,
@@ -104,11 +143,17 @@ def _const_key(value) -> tuple:
 
 class _Compiler:
     def __init__(self, func: ast.FunctionDef, global_map: dict[str, str],
-                 attr_map: dict[tuple[str, str], str], imported_aliases: set[str]):
+                 attr_map: dict[tuple[str, str], str], imported_aliases: set[str],
+                 perm: list[int] | None = None, key_int: int = 0,
+                 seed: str = "", module: str = ""):
         self.func = func
         self.global_map = global_map
         self.attr_map = attr_map
         self.imported_aliases = imported_aliases
+        self.perm = perm if perm is not None else list(range(N_OPS))
+        self.key_int = key_int
+        self.seed = seed
+        self.module = module
         self.locals: list[str] = []
         self._local_idx: dict[str, int] = {}
         self.consts: list = []
@@ -147,7 +192,33 @@ class _Compiler:
             self._stmt(stmt)
         self._emit(OP_LOAD_CONST, self._const(None))
         self._emit(OP_RETURN)
-        return _encode(self.code, self.consts, len(self.locals))
+        self._insert_nops()
+        plain = _encode(self.code, self.consts, len(self.locals), self.perm)
+        if not self.key_int:
+            return plain
+        sealed = hashlib.sha256(plain).digest()[:4] + plain
+        return _xor_stream(sealed, self.key_int)
+
+    def _insert_nops(self) -> None:
+        """Insert junk NOPs into the bytecode (alpha.6).
+
+        A NOP falls through to the next instruction, so inserting one
+        is always safe as long as jump targets past the insertion
+        point are shifted by one; a jump landing exactly on the NOP
+        just falls through to the original target.
+        """
+        if not self.seed:
+            return
+        rng = random.Random(int(hashlib.sha256(
+            f"{self.seed}\x00{self.module}\x00{self.func.name}\x00vm-nop".encode()
+        ).hexdigest()[:8], 16))
+        n = min(5, max(2, len(self.code) // 10))
+        for _ in range(n):
+            pos = rng.randint(0, len(self.code))
+            self.code.insert(pos, [OP_NOP, 0])
+            for instr in self.code:
+                if instr[0] in _JUMP_OPS and instr[1] > pos:
+                    instr[1] += 1
 
     # ------------------------------------------------------------- stmts
     def _stmt(self, node: ast.AST) -> None:
@@ -406,11 +477,14 @@ class _Compiler:
 # ------------------------------------------------------------------
 # payload encoding
 # ------------------------------------------------------------------
-def _encode(code: list[list[int]], consts: list, nlocals: int) -> bytes:
+def _encode(code: list[list[int]], consts: list, nlocals: int,
+            perm: list[int] | None = None) -> bytes:
+    if perm is None:
+        perm = list(range(N_OPS))
     out = bytearray()
     out += struct.pack(">HHH", len(code), len(consts), nlocals)
     for op, arg in code:
-        out += struct.pack(">I", (op << 24) | arg)
+        out += struct.pack(">I", (perm[op] << 24) | arg)
     for c in consts:
         if c is None:
             out.append(0)
@@ -445,13 +519,38 @@ def executor_name_for(seed: str, module: str) -> str:
     return "_" + digest[:10]
 
 
-def executor_source(exec_name: str) -> str:
-    """Source of the embedded stack-VM interpreter."""
+def executor_source(exec_name: str, perm: list[int] | None = None,
+                    key_int: int = 0) -> str:
+    """Source of the embedded stack-VM interpreter.
+
+    ``perm`` is the per-file opcode permutation (perm[logical] =
+    numeric); the interpreter embeds its inverse. ``key_int`` is the
+    per-file payload key; 0 means the payload is stored plain (tests
+    only -- real runs always seal it).
+    """
+    if perm is None:
+        perm = list(range(N_OPS))
+    inv = [0] * N_OPS
+    for logical, numeric in enumerate(perm):
+        inv[numeric] = logical
     return f'''def {exec_name}(_p, _a, _g):
     import base64 as _b64
+    import hashlib as _hl
     import operator as _om
     import struct as _st
     _d = _b64.b64decode(_p.encode("ascii"))
+    _kk = {key_int}
+    if _kk:
+        _stt = _kk & 2147483647
+        _db = bytearray(_d)
+        for _i in range(len(_db)):
+            _stt = (_stt * 1103515245 + 12345) & 2147483647
+            _db[_i] ^= (_stt >> 16) & 255
+        _d = bytes(_db)
+        if _hl.sha256(_d[4:]).digest()[:4] != _d[:4]:
+            raise ValueError("bad vm payload")
+        _d = _d[4:]
+    _pm = {inv!r}
     _n, _c, _l = _st.unpack(">HHH", _d[:6])
     _o = 6
     _code = []
@@ -499,7 +598,10 @@ def executor_source(exec_name: str) -> str:
     while True:
         _op, _x = _code[_pc]
         _pc += 1
-        if _op == 0:
+        _op = _pm[_op]
+        if _op == 25:
+            pass
+        elif _op == 0:
             _s.append(_k[_x])
         elif _op == 1:
             _s.append(_loc[_x])
@@ -627,12 +729,16 @@ def _docstring_stmt(func: ast.FunctionDef) -> ast.Expr | None:
 
 def apply_vmp(tree: ast.Module, seed: str, module: str,
               global_map: dict[str, str], attr_map: dict[tuple[str, str], str],
-              imported_aliases: set[str]) -> tuple[int, str | None]:
+              imported_aliases: set[str]) -> tuple[int, str | None, list[int], int]:
     """Replace eligible top-level functions with VM stubs.
 
-    Returns (number of functions VM'd, executor name or None).
+    Returns (number of functions VM'd, executor name or None,
+    opcode permutation, payload key). The obfuscator needs the
+    permutation and key to build the matching interpreter.
     """
     exec_name = executor_name_for(seed, module)
+    perm = perm_for(seed, module)
+    key_int = key_for(seed, module)
     count = 0
     new_body: list[ast.stmt] = []
     for stmt in tree.body:
@@ -640,7 +746,9 @@ def apply_vmp(tree: ast.Module, seed: str, module: str,
             new_body.append(stmt)
             continue
         try:
-            payload = _Compiler(stmt, global_map, attr_map, imported_aliases).compile()
+            payload = _Compiler(stmt, global_map, attr_map, imported_aliases,
+                                perm=perm, key_int=key_int,
+                                seed=seed, module=module).compile()
         except NotVMable:
             new_body.append(stmt)
             continue
@@ -679,4 +787,4 @@ def apply_vmp(tree: ast.Module, seed: str, module: str,
         new_body.append(stub)
         count += 1
     tree.body = new_body
-    return count, (exec_name if count else None)
+    return count, (exec_name if count else None), perm, key_int

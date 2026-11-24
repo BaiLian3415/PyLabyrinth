@@ -291,6 +291,40 @@ class Renamer(ast.NodeTransformer):
                 # identity binding: lookups inside must find the arg itself
                 self.scopes[-1].bindings[arg.arg] = arg.arg
 
+        # Pre-scan: bind every name stored anywhere in this function's
+        # own scope before visiting the body. Renaming is otherwise
+        # order-dependent (a Load is only renamed if a Store for it
+        # was already seen), and control-flow flattening shuffles the
+        # dispatcher branches, so a use can precede its assignment in
+        # source order while still running after it. This matches
+        # Python scoping: any assignment in a function makes the name
+        # local throughout it. Nested scopes (functions, classes,
+        # lambdas, comprehensions) are not descended into, and names
+        # declared global/nonlocal anywhere in this scope are skipped.
+        _gn: set[str] = set()
+        _stack: list[ast.AST] = list(node.body)
+        _nested = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                   ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp,
+                   ast.GeneratorExp)
+        while _stack:
+            _n = _stack.pop()
+            if isinstance(_n, _nested):
+                continue
+            if isinstance(_n, ast.Global):
+                _gn.update(_n.names)
+            elif isinstance(_n, ast.Nonlocal):
+                _gn.update(_n.names)
+            _stack.extend(ast.iter_child_nodes(_n))
+        _stack = list(node.body)
+        while _stack:
+            _n = _stack.pop()
+            if isinstance(_n, _nested):
+                continue
+            if isinstance(_n, ast.Name) and isinstance(_n.ctx, ast.Store):
+                if _n.id not in _gn:
+                    self._define(_n.id)
+            _stack.extend(ast.iter_child_nodes(_n))
+
         node.body = self._strip_docstring(node.body)
         node.body = [self.visit(stmt) for stmt in node.body]
         self._path.pop()
