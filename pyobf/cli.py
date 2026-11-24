@@ -1,4 +1,4 @@
-"""CLI for pyobf v0.1alpha.3.
+"""CLI for pyobf v0.1alpha.4.
 
 Usage (both work):
     python -m pyobf -i src -o dist            # from the project root
@@ -29,14 +29,14 @@ else:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="pyobf",
-        description="pyobf v0.1alpha.3 — 纯标准库的 Python 代码混淆器（AST 方式，不用正则改名）。",
+        description="pyobf v0.1alpha.4 — 纯标准库的 Python 代码混淆器（AST 方式，不用正则改名）。",
     )
     p.add_argument("--version", action="version", version=f"pyobf {__version__}")
     p.add_argument("-i", "--input", required=True, help="输入：单个 .py 文件或目录")
     p.add_argument("-o", "--output", required=False, help="输出：文件或目录。默认：输入名 + _obf")
     p.add_argument("--seed", default=None, help="随机种子（字符串/数字）。不给则随机生成并打印出来，方便复现")
     p.add_argument("--level", type=int, choices=[1, 2, 3], default=1,
-                   help="强度：1=仅局部变量重命名+去注释；2=+私有顶层/私有属性改名+逐串加盐字符串与 bytes 加密+不可折叠整数混淆；3=+不透明死代码+顶层函数乱序。默认 1")
+                   help="强度：1=仅局部变量重命名+去注释；2=+私有顶层/私有属性改名+逐串加盐字符串与 bytes 加密+不可折叠整数混淆；3=+不透明死代码+顶层函数乱序+虚拟机保护（VMP）。默认 1")
     p.add_argument("--rename-top", dest="rename_top", action="store_true", default=None, help="重命名私有顶层 def/class/变量（level>=2 默认开启）")
     p.add_argument("--no-rename-top", dest="rename_top", action="store_false", help="不重命名顶层 def/class")
     p.add_argument("--strings", dest="strings", action="store_true", default=None, help="加密字符串常量（level>=2 默认开启）")
@@ -47,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-attrs", dest="attrs", action="store_false", help="不重命名私有属性")
     p.add_argument("--shuffle", dest="shuffle", action="store_true", default=None, help="打乱顶层函数顺序（level 3 默认开启，仅限无定义期依赖的函数）")
     p.add_argument("--no-shuffle", dest="shuffle", action="store_false", help="不打乱顶层函数顺序")
+    p.add_argument("--vmp", dest="vmp", action="store_true", default=None, help="虚拟机保护：把符合条件的顶层函数编译成自定义字节码（level 3 默认开启）")
+    p.add_argument("--no-vmp", dest="vmp", action="store_false", help="不做虚拟机保护")
     p.add_argument("--rename-args", action="store_true", help="实验性：重命名函数参数（仅改写同文件内直接调用的关键字参数，跨文件关键字调用可能失效）")
     p.add_argument("--junk", dest="junk", action="store_true", default=None, help="插入死代码（level 3 默认开启）")
     p.add_argument("--no-junk", dest="junk", action="store_false", help="不插入死代码")
@@ -103,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
             obfuscate_ints=args.ints,
             rename_attrs=args.attrs,
             shuffle_top=args.shuffle,
+            vmp=args.vmp,
         )
     except ObfuscateError as exc:
         print(f"错误：{exc}", file=sys.stderr)
@@ -119,12 +122,13 @@ def main(argv: list[str] | None = None) -> int:
     strings_n = sum(f.strings_encrypted for f in result.files)
     ints_n = sum(f.ints_obfuscated for f in result.files)
     bytes_n = sum(f.bytes_encrypted for f in result.files)
+    vm_n = sum(f.vm_functions for f in result.files)
     if args.verbose:
         for f in result.files:
-            print(f"  {f.rel}: 改名 {f.renamed_locals + f.renamed_top + f.attrs_renamed}（属性 {f.attrs_renamed}），字符串 {f.strings_encrypted}，bytes {f.bytes_encrypted}，整数 {f.ints_obfuscated}，乱序 {f.shuffled_defs}，{f.bytes_in} -> {f.bytes_out} 字节")
+            print(f"  {f.rel}: 改名 {f.renamed_locals + f.renamed_top + f.attrs_renamed}（属性 {f.attrs_renamed}），字符串 {f.strings_encrypted}，bytes {f.bytes_encrypted}，整数 {f.ints_obfuscated}，乱序 {f.shuffled_defs}，VMP {f.vm_functions}，{f.bytes_in} -> {f.bytes_out} 字节")
     if not args.quiet:
         mode = "试运行（未写文件）" if args.dry_run else f"已写到 {out}"
-        print(f"完成：{len(result.files)} 个文件，改名 {renamed} 处，加密字符串 {strings_n} 个，bytes {bytes_n} 个，混淆整数 {ints_n} 个，{result.total_in} -> {result.total_out} 字节。{mode}")
+        print(f"完成：{len(result.files)} 个文件，改名 {renamed} 处，加密字符串 {strings_n} 个，bytes {bytes_n} 个，混淆整数 {ints_n} 个，VMP 函数 {vm_n} 个，{result.total_in} -> {result.total_out} 字节。{mode}")
         print(f"seed={seed} level={args.level}。注意：混淆不是加密，懂行的人仍可还原；映射文件不要随产物分发。")
     else:
         print(f"完成：{len(result.files)} 个文件 -> {out}")

@@ -212,6 +212,54 @@ class TestTransform(unittest.TestCase):
             res = run_py(out)
             self.assertEqual(res.stdout.strip(), "102026")
 
+    def test_vmp_function_output_identical(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", "def calc(a, b):\n    x = a * b + 1\n    if x > 10:\n        return x * 2\n    return x - 1\nprint(calc(3, 4), calc(2, 3))\n")
+            out = tmp / "out.py"
+            res = obfuscate_project(input_path=src, output_path=out, seed="42", level=3)
+            self.assertEqual(res.files[0].vm_functions, 1)
+            text = out.read_text(encoding="utf-8")
+            self.assertNotIn("a * b + 1", text)
+            r = run_py(out)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "26 6")
+
+    def test_vmp_default_arg_and_private_global(self):
+        # default arg still works via the stub; a module-level private
+        # constant referenced by the VM'd function resolves under its
+        # renamed name.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", "_BASE = 100\ndef total(x, k=2):\n    return x * k + _BASE\nprint(total(5), total(5, 3))\n")
+            out = tmp / "out.py"
+            obfuscate_project(input_path=src, output_path=out, seed="42", level=3)
+            r = run_py(out)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "110 115")
+
+    def test_vmp_cross_file_private_call(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            srcdir = tmp / "src"
+            write(srcdir, "helper.py", "def _double(x):\n    return x * 2\n")
+            write(srcdir, "main.py", "from helper import _double\nprint(_double(21))\n")
+            out = tmp / "out"
+            obfuscate_project(input_path=srcdir, output_path=out, seed="42", level=3)
+            r = subprocess.run([sys.executable, "main.py"], cwd=out, capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "42")
+
+    def test_vmp_off_at_level2(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = write(tmp, "a.py", "def f(a):\n    return a + 1\nprint(f(1))\n")
+            out = tmp / "out.py"
+            res = obfuscate_project(input_path=src, output_path=out, seed="42", level=2)
+            self.assertEqual(res.files[0].vm_functions, 0)
+            res2 = obfuscate_project(input_path=src, output_path=out, seed="42", level=2, vmp=True)
+            self.assertEqual(res2.files[0].vm_functions, 1)
+
     def test_shuffle_top_defs(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

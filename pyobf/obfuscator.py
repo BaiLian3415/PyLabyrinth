@@ -1,4 +1,4 @@
-"""Orchestration for pyobf v0.1alpha.3: discover, two-pass rename, write."""
+"""Orchestration for pyobf v0.1alpha.4: discover, two-pass rename, write."""
 from __future__ import annotations
 
 import ast
@@ -12,6 +12,7 @@ from pathlib import Path
 from .naming import NameGenerator
 from .strings import bytes_helper_name_for, derive_master, helper_name_for, helper_source, helper_source_bytes
 from .transform import Renamer
+from .vm import apply_vmp, executor_source
 
 
 class ObfuscateError(Exception):
@@ -30,6 +31,7 @@ class FileResult:
     bytes_encrypted: int = 0
     attrs_renamed: int = 0
     shuffled_defs: int = 0
+    vm_functions: int = 0
     bytes_in: int = 0
     bytes_out: int = 0
 
@@ -168,6 +170,46 @@ def _def_time_names(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
     return names
 
 
+def _vm_name_maps(tree: ast.Module, mod: str, top_maps: dict[str, dict[str, str]]):
+    """Name maps the VM compiler needs to resolve globals at runtime.
+
+    - global_map: original global name -> runtime name. Private
+      top-level names of this file and of modules imported with
+      ``from x import _y`` were renamed by the top map, so the VM
+      must look them up under the obfuscated name.
+    - attr_map: (imported module alias, private attr) -> runtime attr,
+      for ``import mod`` + ``mod._attr``.
+    - imported_aliases: aliases introduced by plain ``import``.
+    """
+    global_map: dict[str, str] = dict(top_maps.get(mod, {}))
+    attr_map: dict[tuple[str, str], str] = {}
+    imported_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                imported_aliases.add(name)
+                src_top = top_maps.get(alias.name, {})
+                for attr, obf in src_top.items():
+                    attr_map[(name, attr)] = obf
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                src = node.module or ""
+            else:
+                package = mod.rpartition(".")[0] if "." in mod else ""
+                parts = package.split(".") if package else []
+                if node.level > 1:
+                    cut = node.level - 1
+                    parts = parts[:-cut] if len(parts) >= cut else []
+                base = ".".join(parts)
+                src = f"{base}.{node.module}" if base and node.module else (node.module or base)
+            src_top = top_maps.get(src, {})
+            for alias in node.names:
+                if alias.name in src_top:
+                    global_map[alias.name] = src_top[alias.name]
+    return global_map, attr_map, imported_aliases
+
+
 def _shuffle_top_defs(tree: ast.Module, seed: str, module: str) -> int:
     """Shuffle independent top-level defs/class (level 3 only).
 
@@ -271,6 +313,7 @@ def obfuscate_project(
     obfuscate_ints: bool | None = None,
     rename_attrs: bool | None = None,
     shuffle_top: bool | None = None,
+    vmp: bool | None = None,
 ) -> RunResult:
     if level not in (1, 2, 3):
         raise ObfuscateError("level 只能是 1、2、3")
@@ -286,6 +329,8 @@ def obfuscate_project(
         rename_attrs = level >= 2
     if shuffle_top is None:
         shuffle_top = level >= 3
+    if vmp is None:
+        vmp = level >= 3
 
     keep = set(keep_names or set())
     exclude = list(exclude or [])
@@ -323,6 +368,17 @@ def obfuscate_project(
         except SyntaxError as exc:
             raise ObfuscateError(f"{rel}: 语法错误 {exc.msg} (行 {exc.lineno})") from exc
 
+        # VMP runs before the renamer: it replaces eligible top-level
+        # function bodies with stubs calling the embedded VM. The stub
+        # keeps the original signature, so the renamer then treats it
+        # like any other function (top-map rename, string encryption
+        # of the payload, int obfuscation of nothing).
+        vm_count = 0
+        vm_exec_name: str | None = None
+        if vmp:
+            gmap, amap, ialiases = _vm_name_maps(tree, mod, top_maps)
+            vm_count, vm_exec_name = apply_vmp(tree, str(seed), mod, gmap, amap, ialiases)
+
         helper_name = helper_name_for(str(seed), mod)
         bytes_helper_name = bytes_helper_name_for(str(seed), mod)
         renamer = Renamer(
@@ -349,6 +405,8 @@ def obfuscate_project(
             _insert_helper(new_tree, helper_name, helper_source(helper_name, master), set(renamer.mapping.values()))
         if renamer.stats["bytes_encrypted"] > 0:
             _insert_helper(new_tree, bytes_helper_name, helper_source_bytes(bytes_helper_name, master), set(renamer.mapping.values()))
+        if vm_count > 0 and vm_exec_name is not None:
+            _insert_helper(new_tree, vm_exec_name, executor_source(vm_exec_name), set(renamer.mapping.values()))
         if add_junk:
             junk_tree = ast.parse(_junk_source(str(seed), mod))
             # junk source is now several statements (unused function +
@@ -380,6 +438,7 @@ def obfuscate_project(
             bytes_encrypted=renamer.stats["bytes_encrypted"],
             attrs_renamed=renamer.stats["attrs_renamed"],
             shuffled_defs=shuffled,
+            vm_functions=vm_count,
             bytes_in=len(text.encode("utf-8")),
             bytes_out=len(out_text.encode("utf-8")),
         )
@@ -395,7 +454,7 @@ def obfuscate_project(
 def mapping_payload(result: RunResult) -> dict:
     return {
         "tool": "pyobf",
-        "version": "0.1.0-alpha.3",
+        "version": "0.1.0-alpha.4",
         "seed": result.seed,
         "level": result.level,
         "warning": "此映射文件可用于调试还原，发布时不要随混淆产物一起分发。",
